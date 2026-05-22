@@ -1,5 +1,4 @@
-"""
-WMOC local broker — SQLite-backed durable inbox/outbox for named roles.
+"""WMOC local broker — SQLite-backed durable inbox/outbox for named roles.
 
 Phase 0 minimal slice: init_db, post, get, fetch only. No claim / complete /
 block / fail / approve yet. No MCP. The broker is not the orchestrator and
@@ -19,42 +18,46 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-
 # --------------------------------------------------------------------------- #
 # Allowlists
 # --------------------------------------------------------------------------- #
 
-CANONICAL_ROLES: frozenset[str] = frozenset({
-    "pc",
-    "screen_left",
-    "screen_right",
-    "tv",
-    "generic",
-    "human",
-    "system",
-})
+CANONICAL_ROLES: frozenset[str] = frozenset(
+    {
+        "pc",
+        "screen_left",
+        "screen_right",
+        "tv",
+        "generic",
+        "human",
+        "system",
+    }
+)
 
-MESSAGE_TYPES: frozenset[str] = frozenset({
-    "request",
-    "response",
-    "critique",
-    "approval_request",
-    "approval_decision",
-    "status",
-    "error",
-})
+MESSAGE_TYPES: frozenset[str] = frozenset(
+    {
+        "request",
+        "response",
+        "critique",
+        "approval_request",
+        "approval_decision",
+        "status",
+        "error",
+    }
+)
 
-STATUSES: frozenset[str] = frozenset({
-    "new",
-    "claimed",
-    "done",
-    "blocked",
-    "failed",
-    "expired",
-})
+STATUSES: frozenset[str] = frozenset(
+    {
+        "new",
+        "claimed",
+        "done",
+        "blocked",
+        "failed",
+        "expired",
+    }
+)
 
 WILDCARD = "*"
-
 
 # --------------------------------------------------------------------------- #
 # Errors
@@ -135,24 +138,24 @@ def _now() -> str:
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts_created         TEXT    NOT NULL,
-    from_role          TEXT    NOT NULL,
-    to_role            TEXT    NOT NULL,
-    type               TEXT    NOT NULL,
-    status             TEXT    NOT NULL DEFAULT 'new',
-    thread_id          TEXT,
-    parent_id          INTEGER,
-    subject            TEXT,
-    body               TEXT,
-    payload_json       TEXT,
-    requires_approval  INTEGER NOT NULL DEFAULT 0,
-    approval_status    TEXT,
-    claimed_by         TEXT,
-    ts_claimed         TEXT,
-    ts_completed       TEXT,
-    result_json        TEXT,
-    error              TEXT,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_created          TEXT    NOT NULL,
+    from_role           TEXT    NOT NULL,
+    to_role             TEXT    NOT NULL,
+    type                TEXT    NOT NULL,
+    status              TEXT    NOT NULL DEFAULT 'new',
+    thread_id           TEXT,
+    parent_id           INTEGER,
+    subject             TEXT,
+    body                TEXT,
+    payload_json        TEXT,
+    requires_approval   INTEGER NOT NULL DEFAULT 0,
+    approval_status     TEXT,
+    claimed_by          TEXT,
+    ts_claimed          TEXT,
+    ts_completed        TEXT,
+    result_json         TEXT,
+    error               TEXT,
     FOREIGN KEY (parent_id) REFERENCES messages(id)
 );
 
@@ -222,8 +225,15 @@ def post(
             ) VALUES (?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?)
             """,
             (
-                ts, from_norm, to_norm, msg_type,
-                thread_id, parent_id, subject, body, payload_json,
+                ts,
+                from_norm,
+                to_norm,
+                msg_type,
+                thread_id,
+                parent_id,
+                subject,
+                body,
+                payload_json,
                 1 if requires_approval else 0,
             ),
         )
@@ -242,6 +252,105 @@ def post(
         raise
 
     return int(message_id)
+
+
+def claim(conn: sqlite3.Connection, message_id: int, claimer_role: str) -> None:
+    """Claim a new message for a specific role."""
+    claimer = _validate_role(claimer_role, allow_wildcard=False)
+    row = conn.execute(
+        "SELECT id, to_role, status FROM messages WHERE id = ?",
+        (int(message_id),),
+    ).fetchone()
+    if row is None:
+        raise BrokerError(f"message not found: {message_id}")
+
+    if row["status"] != "new":
+        raise BrokerError(
+            f"message {message_id} is {row['status']!r}, expected 'new'"
+        )
+
+    if row["to_role"] not in {claimer, WILDCARD}:
+        raise BrokerError(
+            f"message {message_id} addressed to {row['to_role']!r}, not {claimer!r}"
+        )
+
+    ts = _now()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE messages
+            SET status = 'claimed',
+                claimed_by = ?,
+                ts_claimed = ?
+            WHERE id = ?
+            """,
+            (claimer, ts, int(message_id)),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit (
+                ts, message_id, actor, action, before_status, after_status
+            ) VALUES (?, ?, ?, 'claim', 'new', 'claimed')
+            """,
+            (ts, int(message_id), claimer),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def complete(conn: sqlite3.Connection, message_id: int, claimer_role: str) -> None:
+    """Complete a claimed message for a specific role."""
+    claimer = _validate_role(claimer_role, allow_wildcard=False)
+    row = conn.execute(
+        "SELECT id, to_role, status, claimed_by FROM messages WHERE id = ?",
+        (int(message_id),),
+    ).fetchone()
+    if row is None:
+        raise BrokerError(f"message not found: {message_id}")
+
+    if row["status"] != "claimed":
+        raise BrokerError(
+            f"message {message_id} is {row['status']!r}, expected 'claimed'"
+        )
+
+    if row["to_role"] not in {claimer, WILDCARD}:
+        raise BrokerError(
+            f"message {message_id} addressed to {row['to_role']!r}, not {claimer!r}"
+        )
+
+    if row["claimed_by"] not in (None, claimer):
+        raise BrokerError(
+            f"message {message_id} claimed by {row['claimed_by']!r}, not {claimer!r}"
+        )
+
+    ts = _now()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE messages
+            SET status = 'done',
+                claimed_by = COALESCE(claimed_by, ?),
+                ts_completed = ?
+            WHERE id = ?
+            """,
+            (claimer, ts, int(message_id)),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit (
+                ts, message_id, actor, action, before_status, after_status
+            ) VALUES (?, ?, ?, 'complete', 'claimed', 'done')
+            """,
+            (ts, int(message_id), claimer),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 # --------------------------------------------------------------------------- #
