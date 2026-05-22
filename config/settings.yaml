@@ -1,0 +1,32 @@
+# Non-secret runtime configuration. Safe to commit.
+
+orchestrator:
+  model: claude-sonnet-4-6
+  max_steps_per_run: 20
+  per_step_timeout_seconds: 60
+
+specialists:
+  perplexity:
+    model: sonar
+    timeout_seconds: 30
+    max_retries: 1
+  gemini:
+    model: gemini-2.5-pro
+    timeout_seconds: 60
+    max_retries: 1
+  grok:
+    model: grok-4
+    timeout_seconds: 30
+    max_retries: 1
+
+approval:
+  mode: cli              # also: slack, email (future)
+  default_risky_types:   # any step with one of these types defaults to requires_approval=true
+    - mail.send
+    - fs.write_outside_workspace
+    - graph.send_mail
+    - shell.run
+
+logging:
+  runs_dir: logs/runs
+  approvals_file: logs/approvals.jsonl
