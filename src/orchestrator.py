@@ -20,9 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .agents import claude_client, gemini_client, perplexity_client
+from . import broker
 from .approval_gate import ApprovalDecision, ApprovalGate
-from .services.critique_service import review_brief
 
 
 # --------------------------------------------------------------------------- #
@@ -66,6 +65,8 @@ class RunLog:
 
 def stub_plan_meeting_prep() -> list[Step]:
     """Hard-coded plan that mirrors workflows/meeting_prep_brief.md."""
+    from .agents import perplexity_client
+
     return [
         Step("s1", "tool_call", "calendar.next", {"window_hours": 24}),
         Step("s2", "compose", "claude", {"task": "extract_attendees_agenda"}),
@@ -115,11 +116,53 @@ def stub_plan_meeting_prep() -> list[Step]:
 
 
 # --------------------------------------------------------------------------- #
+# Broker wiring smoke (Phase 0 minimal slice)
+# --------------------------------------------------------------------------- #
+
+
+def broker_smoke(db_path: Path) -> int:
+    """Post one pc -> screen_left message via the broker and fetch it back.
+
+    Phase 0 only. Does not touch the step plan, approval gate, or any agent
+    client. Exists to confirm the orchestrator can drive broker.post / fetch.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = broker.connect(str(db_path))
+    try:
+        broker.init_db(conn)
+        mid = broker.post(
+            conn,
+            from_role="pc",
+            to_role="screen_left",
+            type="status",
+            subject="broker smoke",
+            body="hello from pc",
+        )
+        print(f"[WMOC] broker: posted message id={mid} (db={db_path})")
+
+        rows = broker.fetch(conn, to_role="screen_left")
+        match = next((r for r in rows if r["id"] == mid), None)
+        if match is None:
+            print(
+                f"[WMOC] broker: ERROR — posted id={mid} not visible to screen_left"
+            )
+            return 1
+        print("[WMOC] broker: fetched message for screen_left:")
+        print(json.dumps(match, indent=2, default=str))
+        return 0
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
 # Run loop
 # --------------------------------------------------------------------------- #
 
 
 def run(goal: str, dry_run: bool, runs_dir: Path) -> int:
+    from .agents import claude_client, gemini_client, perplexity_client
+    from .services.critique_service import review_brief
+
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     log = RunLog(run_id=run_id, started_at=run_id, goal=goal)
     gate = ApprovalGate(audit_path=runs_dir.parent / "approvals.jsonl")
@@ -282,7 +325,20 @@ def main(argv: list[str] | None = None) -> int:
         default="logs/runs",
         help="Where to write run logs",
     )
+    parser.add_argument(
+        "--broker-smoke",
+        action="store_true",
+        help="Phase 0: post one pc->screen_left message via the broker and fetch it back",
+    )
+    parser.add_argument(
+        "--broker-db",
+        default="logs/broker.sqlite",
+        help="SQLite path used by --broker-smoke",
+    )
     args = parser.parse_args(argv)
+
+    if args.broker_smoke:
+        return broker_smoke(Path(args.broker_db))
 
     return run(goal=args.goal, dry_run=args.dry_run, runs_dir=Path(args.runs_dir))
 
