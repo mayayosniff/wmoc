@@ -15,6 +15,6 @@ def test_broker_smoke_posts_and_fetches_for_screen_left(tmp_path, capsys):
 
     assert rc == 0
     assert "from_role" in out
-    assert "pc" in out
+    assert "laptop" in out
     assert "to_role" in out
     assert "screen_left" in out

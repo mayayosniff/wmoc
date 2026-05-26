@@ -1,7 +1,6 @@
 """Smoke tests for src/broker.py (Phase 0 minimal slice).
 
-Covers only init_db, post, get, fetch. No claim/complete/approve — those
-verbs don't exist yet and are not tested here.
+Covers init_db, post, get, fetch, claim, and complete.
 """
 from __future__ import annotations
 
@@ -9,6 +8,8 @@ import pytest
 
 from src.broker import (
     BrokerError,
+    claim,
+    complete,
     connect,
     fetch,
     get,
@@ -44,7 +45,7 @@ def test_init_db_is_idempotent_on_fresh_db(tmp_path):
 def test_post_inserts_message_and_matching_audit_row(conn):
     mid = post(
         conn,
-        from_role="pc",
+        from_role="laptop",
         to_role="screen_left",
         type="request",
         subject="hello",
@@ -56,7 +57,7 @@ def test_post_inserts_message_and_matching_audit_row(conn):
         "SELECT from_role, to_role, type, status FROM messages WHERE id = ?",
         (mid,),
     ).fetchone()
-    assert tuple(msg) == ("pc", "screen_left", "request", "new")
+    assert tuple(msg) == ("laptop", "screen_left", "request", "new")
 
     audit_rows = conn.execute(
         "SELECT actor, action, before_status, after_status FROM audit "
@@ -64,14 +65,14 @@ def test_post_inserts_message_and_matching_audit_row(conn):
         (mid,),
     ).fetchall()
     assert len(audit_rows) == 1
-    assert tuple(audit_rows[0]) == ("pc", "post", None, "new")
+    assert tuple(audit_rows[0]) == ("laptop", "post", None, "new")
 
 
 def test_get_returns_inserted_message_with_decoded_payload(conn):
     mid = post(
         conn,
-        from_role="pc",
-        to_role="tv",
+        from_role="laptop",
+        to_role="monitor",
         type="request",
         subject="s",
         body="b",
@@ -81,8 +82,8 @@ def test_get_returns_inserted_message_with_decoded_payload(conn):
     row = get(conn, mid)
     assert row is not None
     assert row["id"] == mid
-    assert row["from_role"] == "pc"
-    assert row["to_role"] == "tv"
+    assert row["from_role"] == "laptop"
+    assert row["to_role"] == "monitor"
     assert row["type"] == "request"
     assert row["status"] == "new"
     assert row["payload"] == {"k": "v"}
@@ -92,40 +93,44 @@ def test_get_returns_inserted_message_with_decoded_payload(conn):
 
 
 def test_fetch_returns_direct_messages(conn):
-    mid = post(conn, from_role="pc", to_role="tv", type="status", body="x")
-    rows = fetch(conn, to_role="tv")
+    mid = post(conn, from_role="laptop", to_role="monitor", type="status", body="x")
+    rows = fetch(conn, to_role="monitor")
     assert mid in [r["id"] for r in rows]
     other = fetch(conn, to_role="screen_left")
     assert mid not in [r["id"] for r in other]
 
 
 def test_fetch_includes_wildcard_broadcasts(conn):
-    direct = post(conn, from_role="pc", to_role="tv", type="status", body="d")
-    broadcast = post(conn, from_role="pc", to_role="*", type="status", body="b")
-    tv_ids = [r["id"] for r in fetch(conn, to_role="tv")]
-    assert direct in tv_ids
-    assert broadcast in tv_ids
+    direct = post(
+        conn, from_role="laptop", to_role="monitor", type="status", body="d"
+    )
+    broadcast = post(
+        conn, from_role="laptop", to_role="*", type="status", body="b"
+    )
+    monitor_ids = [r["id"] for r in fetch(conn, to_role="monitor")]
+    assert direct in monitor_ids
+    assert broadcast in monitor_ids
     sr_ids = [r["id"] for r in fetch(conn, to_role="screen_right")]
     assert broadcast in sr_ids
 
 
 def test_fetch_ordering_is_id_ascending(conn):
     ids = [
-        post(conn, from_role="pc", to_role="tv", type="status", body=str(i))
+        post(conn, from_role="laptop", to_role="monitor", type="status", body=str(i))
         for i in range(5)
     ]
-    fetched = [r["id"] for r in fetch(conn, to_role="tv")]
+    fetched = [r["id"] for r in fetch(conn, to_role="monitor")]
     assert fetched == ids
 
 
 @pytest.mark.parametrize(
     "kwargs",
     [
-        dict(from_role="bogus", to_role="tv", type="status"),
-        dict(from_role="pc", to_role="bogus", type="status"),
-        dict(from_role="pc", to_role="tv", type="not_a_type"),
-        dict(from_role="*", to_role="tv", type="status"),
-        dict(from_role="", to_role="tv", type="status"),
+        dict(from_role="bogus", to_role="monitor", type="status"),
+        dict(from_role="laptop", to_role="bogus", type="status"),
+        dict(from_role="laptop", to_role="monitor", type="not_a_type"),
+        dict(from_role="*", to_role="monitor", type="status"),
+        dict(from_role="", to_role="monitor", type="status"),
     ],
 )
 def test_post_rejects_invalid_inputs(conn, kwargs):
@@ -135,4 +140,61 @@ def test_post_rejects_invalid_inputs(conn, kwargs):
 
 def test_fetch_rejects_invalid_status(conn):
     with pytest.raises(BrokerError):
-        fetch(conn, to_role="tv", status="not_a_status")
+        fetch(conn, to_role="monitor", status="not_a_status")
+
+
+def test_claim_changes_new_to_claimed(conn):
+    mid = post(
+        conn, from_role="laptop", to_role="monitor", type="request", body="x"
+    )
+    claim(conn, mid, "monitor")
+
+    row = get(conn, mid)
+    assert row is not None
+    assert row["status"] == "claimed"
+    assert row["claimed_by"] == "monitor"
+    assert row["ts_claimed"] is not None
+
+    audit_rows = conn.execute(
+        "SELECT actor, action, before_status, after_status FROM audit "
+        "WHERE message_id = ? ORDER BY id ASC",
+        (mid,),
+    ).fetchall()
+    assert tuple(audit_rows[-1]) == ("monitor", "claim", "new", "claimed")
+
+
+def test_complete_changes_claimed_to_done(conn):
+    mid = post(
+        conn, from_role="laptop", to_role="monitor", type="request", body="x"
+    )
+    claim(conn, mid, "monitor")
+    complete(conn, mid, "monitor")
+
+    row = get(conn, mid)
+    assert row is not None
+    assert row["status"] == "done"
+    assert row["claimed_by"] == "monitor"
+    assert row["ts_completed"] is not None
+
+    audit_rows = conn.execute(
+        "SELECT actor, action, before_status, after_status FROM audit "
+        "WHERE message_id = ? ORDER BY id ASC",
+        (mid,),
+    ).fetchall()
+    assert tuple(audit_rows[-1]) == ("monitor", "complete", "claimed", "done")
+
+
+def test_claim_rejects_wrong_role(conn):
+    mid = post(
+        conn, from_role="laptop", to_role="monitor", type="request", body="x"
+    )
+    with pytest.raises(BrokerError):
+        claim(conn, mid, "screen_left")
+
+
+def test_complete_rejects_non_claimed_message(conn):
+    mid = post(
+        conn, from_role="laptop", to_role="monitor", type="request", body="x"
+    )
+    with pytest.raises(BrokerError):
+        complete(conn, mid, "monitor")

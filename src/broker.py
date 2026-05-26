@@ -8,7 +8,7 @@ Usage:
     from src.broker import connect, init_db, post, get, fetch
     conn = connect("broker.sqlite")
     init_db(conn)
-    mid = post(conn, from_role="pc", to_role="screen_left",
+    mid = post(conn, from_role="laptop", to_role="screen_left",
                type="request", subject="hello", body="test")
 """
 from __future__ import annotations
@@ -24,10 +24,10 @@ from typing import Any
 
 CANONICAL_ROLES: frozenset[str] = frozenset(
     {
-        "pc",
+        "laptop",
         "screen_left",
         "screen_right",
-        "tv",
+        "monitor",
         "generic",
         "human",
         "system",

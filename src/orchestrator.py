@@ -121,8 +121,7 @@ def stub_plan_meeting_prep() -> list[Step]:
 
 
 def broker_smoke(db_path: Path) -> int:
-    """Post one pc -> screen_left message via the broker and fetch it back.
-
+    """Post one laptop -> screen_left message via the broker and fetch it back.
     Phase 0 only. Does not touch the step plan, approval gate, or any agent
     client. Exists to confirm the orchestrator can drive broker.post / fetch.
     """
@@ -132,11 +131,11 @@ def broker_smoke(db_path: Path) -> int:
         broker.init_db(conn)
         mid = broker.post(
             conn,
-            from_role="pc",
+            from_role="laptop",
             to_role="screen_left",
             type="status",
             subject="broker smoke",
-            body="hello from pc",
+           body="hello from laptop" ,
         )
         print(f"[WMOC] broker: posted message id={mid} (db={db_path})")
 
