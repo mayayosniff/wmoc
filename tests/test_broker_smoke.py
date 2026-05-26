@@ -1,6 +1,6 @@
-"""Smoke tests for src/broker.py (Phase 0 minimal slice).
+"""Smoke tests for src/broker.py.
 
-Covers init_db, post, get, fetch, claim, and complete.
+Covers init_db, post, get, fetch, claim, complete, fail, and block.
 """
 from __future__ import annotations
 
@@ -8,9 +8,11 @@ import pytest
 
 from src.broker import (
     BrokerError,
+    block,
     claim,
     complete,
     connect,
+    fail,
     fetch,
     get,
     init_db,
@@ -184,6 +186,88 @@ def test_complete_changes_claimed_to_done(conn):
     assert tuple(audit_rows[-1]) == ("monitor", "complete", "claimed", "done")
 
 
+def test_fail_changes_new_to_failed(conn):
+    mid = post(
+        conn, from_role="laptop", to_role="monitor", type="request", body="x"
+    )
+    fail(conn, mid, "monitor", error="tool timeout")
+
+    row = get(conn, mid)
+    assert row is not None
+    assert row["status"] == "failed"
+    assert row["claimed_by"] == "monitor"
+    assert row["error"] == "tool timeout"
+
+    audit_rows = conn.execute(
+        "SELECT actor, action, before_status, after_status FROM audit "
+        "WHERE message_id = ? ORDER BY id ASC",
+        (mid,),
+    ).fetchall()
+    assert tuple(audit_rows[-1]) == ("monitor", "fail", "new", "failed")
+
+
+def test_fail_changes_claimed_to_failed(conn):
+    mid = post(
+        conn, from_role="laptop", to_role="monitor", type="request", body="x"
+    )
+    claim(conn, mid, "monitor")
+    fail(conn, mid, "monitor", error="api failure")
+
+    row = get(conn, mid)
+    assert row is not None
+    assert row["status"] == "failed"
+    assert row["claimed_by"] == "monitor"
+    assert row["error"] == "api failure"
+
+    audit_rows = conn.execute(
+        "SELECT actor, action, before_status, after_status FROM audit "
+        "WHERE message_id = ? ORDER BY id ASC",
+        (mid,),
+    ).fetchall()
+    assert tuple(audit_rows[-1]) == ("monitor", "fail", "claimed", "failed")
+
+
+def test_block_changes_new_to_blocked(conn):
+    mid = post(
+        conn, from_role="laptop", to_role="monitor", type="request", body="x"
+    )
+    block(conn, mid, "monitor", reason="waiting on approval")
+
+    row = get(conn, mid)
+    assert row is not None
+    assert row["status"] == "blocked"
+    assert row["claimed_by"] == "monitor"
+    assert row["error"] == "waiting on approval"
+
+    audit_rows = conn.execute(
+        "SELECT actor, action, before_status, after_status FROM audit "
+        "WHERE message_id = ? ORDER BY id ASC",
+        (mid,),
+    ).fetchall()
+    assert tuple(audit_rows[-1]) == ("monitor", "block", "new", "blocked")
+
+
+def test_block_changes_claimed_to_blocked(conn):
+    mid = post(
+        conn, from_role="laptop", to_role="monitor", type="request", body="x"
+    )
+    claim(conn, mid, "monitor")
+    block(conn, mid, "monitor", reason="need human input")
+
+    row = get(conn, mid)
+    assert row is not None
+    assert row["status"] == "blocked"
+    assert row["claimed_by"] == "monitor"
+    assert row["error"] == "need human input"
+
+    audit_rows = conn.execute(
+        "SELECT actor, action, before_status, after_status FROM audit "
+        "WHERE message_id = ? ORDER BY id ASC",
+        (mid,),
+    ).fetchall()
+    assert tuple(audit_rows[-1]) == ("monitor", "block", "claimed", "blocked")
+
+
 def test_claim_rejects_wrong_role(conn):
     mid = post(
         conn, from_role="laptop", to_role="monitor", type="request", body="x"
@@ -198,3 +282,21 @@ def test_complete_rejects_non_claimed_message(conn):
     )
     with pytest.raises(BrokerError):
         complete(conn, mid, "monitor")
+
+
+def test_fail_rejects_done_message(conn):
+    mid = post(
+        conn, from_role="laptop", to_role="monitor", type="request", body="x"
+    )
+    claim(conn, mid, "monitor")
+    complete(conn, mid, "monitor")
+    with pytest.raises(BrokerError):
+        fail(conn, mid, "monitor", error="too late")
+
+
+def test_block_rejects_wrong_role(conn):
+    mid = post(
+        conn, from_role="laptop", to_role="monitor", type="request", body="x"
+    )
+    with pytest.raises(BrokerError):
+        block(conn, mid, "screen_left", reason="not mine")

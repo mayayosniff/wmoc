@@ -1,8 +1,8 @@
 """WMOC local broker — SQLite-backed durable inbox/outbox for named roles.
 
-Phase 0 minimal slice: init_db, post, get, fetch only. No claim / complete /
-block / fail / approve yet. No MCP. The broker is not the orchestrator and
-does not execute business actions — it persists and serves messages.
+Phase 0 minimal slice: durable broker with typed messages and lifecycle verbs.
+The broker is not the orchestrator and does not execute business actions — it
+persists and serves messages.
 
 Usage:
     from src.broker import connect, init_db, post, get, fetch
@@ -346,6 +346,130 @@ def complete(conn: sqlite3.Connection, message_id: int, claimer_role: str) -> No
             ) VALUES (?, ?, ?, 'complete', 'claimed', 'done')
             """,
             (ts, int(message_id), claimer),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def fail(
+    conn: sqlite3.Connection,
+    message_id: int,
+    actor_role: str,
+    *,
+    error: str,
+) -> None:
+    """Mark a message as failed, recording an error string."""
+    actor = _validate_role(actor_role, allow_wildcard=False)
+    if not isinstance(error, str) or not error.strip():
+        raise BrokerError(f"error must be a non-empty string, got: {error!r}")
+
+    row = conn.execute(
+        "SELECT id, to_role, status, claimed_by FROM messages WHERE id = ?",
+        (int(message_id),),
+    ).fetchone()
+    if row is None:
+        raise BrokerError(f"message not found: {message_id}")
+
+    if row["status"] not in {"new", "claimed"}:
+        raise BrokerError(
+            f"message {message_id} is {row['status']!r}, expected 'new' or 'claimed'"
+        )
+
+    if row["to_role"] not in {actor, WILDCARD}:
+        raise BrokerError(
+            f"message {message_id} addressed to {row['to_role']!r}, not {actor!r}"
+        )
+
+    if row["status"] == "claimed" and row["claimed_by"] not in (None, actor):
+        raise BrokerError(
+            f"message {message_id} claimed by {row['claimed_by']!r}, not {actor!r}"
+        )
+
+    before_status = row["status"]
+    ts = _now()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE messages
+            SET status = 'failed',
+                claimed_by = COALESCE(claimed_by, ?),
+                error = ?
+            WHERE id = ?
+            """,
+            (actor, error.strip(), int(message_id)),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit (
+                ts, message_id, actor, action, before_status, after_status
+            ) VALUES (?, ?, ?, 'fail', ?, 'failed')
+            """,
+            (ts, int(message_id), actor, before_status),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def block(
+    conn: sqlite3.Connection,
+    message_id: int,
+    actor_role: str,
+    *,
+    reason: str,
+) -> None:
+    """Mark a message as blocked, recording the reason in error."""
+    actor = _validate_role(actor_role, allow_wildcard=False)
+    if not isinstance(reason, str) or not reason.strip():
+        raise BrokerError(f"reason must be a non-empty string, got: {reason!r}")
+
+    row = conn.execute(
+        "SELECT id, to_role, status, claimed_by FROM messages WHERE id = ?",
+        (int(message_id),),
+    ).fetchone()
+    if row is None:
+        raise BrokerError(f"message not found: {message_id}")
+
+    if row["status"] not in {"new", "claimed"}:
+        raise BrokerError(
+            f"message {message_id} is {row['status']!r}, expected 'new' or 'claimed'"
+        )
+
+    if row["to_role"] not in {actor, WILDCARD}:
+        raise BrokerError(
+            f"message {message_id} addressed to {row['to_role']!r}, not {actor!r}"
+        )
+
+    if row["status"] == "claimed" and row["claimed_by"] not in (None, actor):
+        raise BrokerError(
+            f"message {message_id} claimed by {row['claimed_by']!r}, not {actor!r}"
+        )
+
+    before_status = row["status"]
+    ts = _now()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE messages
+            SET status = 'blocked',
+                claimed_by = COALESCE(claimed_by, ?),
+                error = ?
+            WHERE id = ?
+            """,
+            (actor, reason.strip(), int(message_id)),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit (
+                ts, message_id, actor, action, before_status, after_status
+            ) VALUES (?, ?, ?, 'block', ?, 'blocked')
+            """,
+            (ts, int(message_id), actor, before_status),
         )
         conn.execute("COMMIT")
     except Exception:
